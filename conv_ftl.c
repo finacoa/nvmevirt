@@ -6,29 +6,39 @@
 #include "nvmev.h"
 #include "conv_ftl.h"
 
+// NAND Flash 只能按 Wordline 擦除，但按 Page 寫入
+// 確定一條 Wordline 何時填滿 : 1) trigger Program Confirm, ECC, or ready for next Wordline. 2) affect GC、WA
 static inline bool last_pg_in_wordline(struct conv_ftl *conv_ftl, struct ppa *ppa)
 {
 	struct ssdparams *spp = &conv_ftl->ssd->sp;
+
+	// pgs_per_oneshotpg : # of oneshot page，一次操作可以影響的 Page 數目
 	return (ppa->g.pg % spp->pgs_per_oneshotpg) == (spp->pgs_per_oneshotpg - 1);
 }
 
+// When to GC : 超過 gc_thres 時(提早準備)
 static bool should_gc(struct conv_ftl *conv_ftl)
 {
 	return (conv_ftl->lm.free_line_cnt <= conv_ftl->cp.gc_thres_lines);
 }
 
+// When to GC, for high priority (最後防線)
 static inline bool should_gc_high(struct conv_ftl *conv_ftl)
 {
 	return conv_ftl->lm.free_line_cnt <= conv_ftl->cp.gc_thres_lines_high;
 }
 
+// Get the PPA (physical network address) based on LPN (cable network address)
+// PPA : describe a physical page addr
 static inline struct ppa get_maptbl_ent(struct conv_ftl *conv_ftl, uint64_t lpn)
 {
+	// maptbl : page level mapping table
 	return conv_ftl->maptbl[lpn];
 }
 
 static inline void set_maptbl_ent(struct conv_ftl *conv_ftl, uint64_t lpn, struct ppa *ppa)
 {
+	// sp.tt_pgs : total # of pages in the SSD
 	NVMEV_ASSERT(lpn < conv_ftl->ssd->sp.tt_pgs);
 	conv_ftl->maptbl[lpn] = *ppa;
 }
@@ -39,16 +49,17 @@ static uint64_t ppa2pgidx(struct conv_ftl *conv_ftl, struct ppa *ppa)
 	uint64_t pgidx;
 
 	NVMEV_DEBUG_VERBOSE("%s: ch:%d, lun:%d, pl:%d, blk:%d, pg:%d\n", __func__,
-			ppa->g.ch, ppa->g.lun, ppa->g.pl, ppa->g.blk, ppa->g.pg);
+						ppa->g.ch, ppa->g.lun, ppa->g.pl, ppa->g.blk, ppa->g.pg);
 
 	pgidx = ppa->g.ch * spp->pgs_per_ch + ppa->g.lun * spp->pgs_per_lun +
-		ppa->g.pl * spp->pgs_per_pl + ppa->g.blk * spp->pgs_per_blk + ppa->g.pg;
+			ppa->g.pl * spp->pgs_per_pl + ppa->g.blk * spp->pgs_per_blk + ppa->g.pg;
 
 	NVMEV_ASSERT(pgidx < spp->tt_pgs);
 
 	return pgidx;
 }
 
+// rmap : reverse mapptbl, uint64_t, assume it's stored in OOB
 static inline uint64_t get_rmap_ent(struct conv_ftl *conv_ftl, struct ppa *ppa)
 {
 	uint64_t pgidx = ppa2pgidx(conv_ftl, ppa);
@@ -64,8 +75,32 @@ static inline void set_rmap_ent(struct conv_ftl *conv_ftl, uint64_t lpn, struct 
 	conv_ftl->rmap[pgidx] = lpn;
 }
 
+/*
+// priority data type
+typedef unsigned long long pqueue_pri_t;
+
+// callback functions to get/set/compare the priority of an element
+// typedef 返回類型 (*函式指標名稱)(參數類型);
+typedef pqueue_pri_t (*pqueue_get_pri_f)(void *a);
+typedef void (*pqueue_set_pri_f)(void *a, pqueue_pri_t pri);
+typedef int (*pqueue_cmp_pri_f)(pqueue_pri_t next, pqueue_pri_t curr);
+
+// struct line 表 SSD 內的一個 Block
+struct line {
+	int id; // line id, the same as corresponding block id
+	int ipc; // invalid page count in this line
+	int vpc; // valid page count in this line
+	struct list_head entry;
+	// position in the priority queue for victim lines
+	size_t pos;
+};
+
+*/
+
+// Implicit Type Conversion : int => pqueue_pri_t(unsigned long long)
 static inline int victim_line_cmp_pri(pqueue_pri_t next, pqueue_pri_t curr)
 {
+	// 比較 next、curr 的 vpc (通常取 vpc 較小的作 victim)
 	return (next > curr);
 }
 
@@ -94,12 +129,24 @@ static inline void consume_write_credit(struct conv_ftl *conv_ftl)
 	conv_ftl->wfc.write_credits--;
 }
 
+/*
+static void foreground_gc(struct conv_ftl *conv_ftl)
+{
+	if (should_gc_high(conv_ftl)) {
+		NVMEV_DEBUG_VERBOSE("should_gc_high passed");
+		// perform GC here until !should_gc(conv_ftl)
+		do_gc(conv_ftl, true);
+	}
+}
+*/
+// 與 Background GC 不同，Foreground GC 在系統無法分配 valid page 時強制觸發，可能中斷 I/O 執行 GC
 static void foreground_gc(struct conv_ftl *conv_ftl);
 
 static inline void check_and_refill_write_credit(struct conv_ftl *conv_ftl)
 {
 	struct write_flow_control *wfc = &(conv_ftl->wfc);
-	if (wfc->write_credits <= 0) {
+	if (wfc->write_credits <= 0)
+	{
 		foreground_gc(conv_ftl);
 
 		wfc->write_credits += wfc->credits_to_refill;
@@ -121,20 +168,27 @@ static void init_lines(struct conv_ftl *conv_ftl)
 	INIT_LIST_HEAD(&lm->full_line_list);
 
 	lm->victim_line_pq = pqueue_init(spp->tt_lines, victim_line_cmp_pri, victim_line_get_pri,
-					 victim_line_set_pri, victim_line_get_pos,
-					 victim_line_set_pos);
+									 victim_line_set_pri, victim_line_get_pos,
+									 victim_line_set_pos);
 
 	lm->free_line_cnt = 0;
-	for (i = 0; i < lm->tt_lines; i++) {
+	for (i = 0; i < lm->tt_lines; i++)
+	{
 		lm->lines[i] = (struct line){
 			.id = i,
 			.ipc = 0,
 			.vpc = 0,
 			.pos = 0,
+			/*
+			LIST_HEAD_INIT() : #define LIST_HEAD_INIT(name) { &(name), &(name) }
+							 即 entry.next = &entry;
+								entry.prev = &entry;
+			*/
 			.entry = LIST_HEAD_INIT(lm->lines[i].entry),
 		};
 
-		/* initialize all the lines as free lines */
+		// initialize all the lines as free lines
+		// list_add_tail(new, head)	把 new 插入到 head 前面（尾端）
 		list_add_tail(&lm->lines[i].entry, &lm->free_line_list);
 		lm->free_line_cnt++;
 	}
@@ -167,13 +221,16 @@ static inline void check_addr(int a, int max)
 static struct line *get_next_free_line(struct conv_ftl *conv_ftl)
 {
 	struct line_mgmt *lm = &conv_ftl->lm;
+	// list_first_entry_or_null : 取出第一個可用節點、如果 list 為空，則回傳 NULL
 	struct line *curline = list_first_entry_or_null(&lm->free_line_list, struct line, entry);
 
-	if (!curline) {
+	if (!curline)
+	{
 		NVMEV_ERROR("No free line left in VIRT !!!!\n");
 		return NULL;
 	}
 
+	// list_del_init : 將節點從 list 中移除，並將節點的 prev 與 next 指標指向自己
 	list_del_init(&curline->entry);
 	lm->free_line_cnt--;
 	NVMEV_DEBUG("%s: free_line_cnt %d\n", __func__, lm->free_line_cnt);
@@ -182,9 +239,12 @@ static struct line *get_next_free_line(struct conv_ftl *conv_ftl)
 
 static struct write_pointer *__get_wp(struct conv_ftl *ftl, uint32_t io_type)
 {
-	if (io_type == USER_IO) {
+	if (io_type == USER_IO)
+	{
 		return &ftl->wp;
-	} else if (io_type == GC_IO) {
+	}
+	else if (io_type == GC_IO)
+	{
 		return &ftl->gc_wp;
 	}
 
@@ -192,6 +252,7 @@ static struct write_pointer *__get_wp(struct conv_ftl *ftl, uint32_t io_type)
 	return NULL;
 }
 
+// 準備 下一個可用的物理寫入位置
 static void prepare_write_pointer(struct conv_ftl *conv_ftl, uint32_t io_type)
 {
 	struct write_pointer *wp = __get_wp(conv_ftl, io_type);
@@ -211,6 +272,19 @@ static void prepare_write_pointer(struct conv_ftl *conv_ftl, uint32_t io_type)
 	};
 }
 
+/*
+[每寫一頁 pg++]
+   ↓
+[pg % pgs_per_oneshotpg == 0] → 換 channel
+   ↓
+[ch 到頂] → 換 LUN
+   ↓
+[lun 到頂] → 換 wordline (pg += step)
+   ↓
+[pg 到頂] → block 寫滿 → 推進至 full/victim list
+   ↓
+[取新空 block] → reset pointer (pg/ch/lun/pl)
+*/
 static void advance_write_pointer(struct conv_ftl *conv_ftl, uint32_t io_type)
 {
 	struct ssdparams *spp = &conv_ftl->ssd->sp;
@@ -218,7 +292,7 @@ static void advance_write_pointer(struct conv_ftl *conv_ftl, uint32_t io_type)
 	struct write_pointer *wpp = __get_wp(conv_ftl, io_type);
 
 	NVMEV_DEBUG_VERBOSE("current wpp: ch:%d, lun:%d, pl:%d, blk:%d, pg:%d\n",
-			wpp->ch, wpp->lun, wpp->pl, wpp->blk, wpp->pg);
+						wpp->ch, wpp->lun, wpp->pl, wpp->blk, wpp->pg);
 
 	check_addr(wpp->pg, spp->pgs_per_blk);
 	wpp->pg++;
@@ -228,6 +302,7 @@ static void advance_write_pointer(struct conv_ftl *conv_ftl, uint32_t io_type)
 	wpp->pg -= spp->pgs_per_oneshotpg;
 	check_addr(wpp->ch, spp->nchs);
 	wpp->ch++;
+
 	if (wpp->ch != spp->nchs)
 		goto out;
 
@@ -244,15 +319,19 @@ static void advance_write_pointer(struct conv_ftl *conv_ftl, uint32_t io_type)
 	if (wpp->pg != spp->pgs_per_blk)
 		goto out;
 
+	// 重設 page index 為 0，準備寫新 block
 	wpp->pg = 0;
 	/* move current line to {victim,full} line list */
-	if (wpp->curline->vpc == spp->pgs_per_line) {
+	if (wpp->curline->vpc == spp->pgs_per_line)
+	{
 		/* all pgs are still valid, move to full line list */
 		NVMEV_ASSERT(wpp->curline->ipc == 0);
 		list_add_tail(&wpp->curline->entry, &lm->full_line_list);
 		lm->full_line_cnt++;
 		NVMEV_DEBUG_VERBOSE("wpp: move line to full_line_list\n");
-	} else {
+	}
+	else
+	{
 		NVMEV_DEBUG_VERBOSE("wpp: line is moved to victim list\n");
 		NVMEV_ASSERT(wpp->curline->vpc >= 0 && wpp->curline->vpc < spp->pgs_per_line);
 		/* there must be some invalid pages in this line */
@@ -276,7 +355,7 @@ static void advance_write_pointer(struct conv_ftl *conv_ftl, uint32_t io_type)
 	NVMEV_ASSERT(wpp->pl == 0);
 out:
 	NVMEV_DEBUG_VERBOSE("advanced wpp: ch:%d, lun:%d, pl:%d, blk:%d, pg:%d (curline %d)\n",
-			wpp->ch, wpp->lun, wpp->pl, wpp->blk, wpp->pg, wpp->curline->id);
+						wpp->ch, wpp->lun, wpp->pl, wpp->blk, wpp->pg, wpp->curline->id);
 }
 
 static struct ppa get_new_page(struct conv_ftl *conv_ftl, uint32_t io_type)
@@ -302,7 +381,8 @@ static void init_maptbl(struct conv_ftl *conv_ftl)
 	struct ssdparams *spp = &conv_ftl->ssd->sp;
 
 	conv_ftl->maptbl = vmalloc(sizeof(struct ppa) * spp->tt_pgs);
-	for (i = 0; i < spp->tt_pgs; i++) {
+	for (i = 0; i < spp->tt_pgs; i++)
+	{
 		conv_ftl->maptbl[i].ppa = UNMAPPED_PPA;
 	}
 }
@@ -312,13 +392,15 @@ static void remove_maptbl(struct conv_ftl *conv_ftl)
 	vfree(conv_ftl->maptbl);
 }
 
+// rmap, reverse mapptbl, assume it's stored in OOB
 static void init_rmap(struct conv_ftl *conv_ftl)
 {
 	int i;
 	struct ssdparams *spp = &conv_ftl->ssd->sp;
 
 	conv_ftl->rmap = vmalloc(sizeof(uint64_t) * spp->tt_pgs);
-	for (i = 0; i < spp->tt_pgs; i++) {
+	for (i = 0; i < spp->tt_pgs; i++)
+	{
 		conv_ftl->rmap[i] = INVALID_LPN;
 	}
 }
@@ -351,7 +433,7 @@ static void conv_init_ftl(struct conv_ftl *conv_ftl, struct convparams *cpp, str
 	init_write_flow_control(conv_ftl);
 
 	NVMEV_INFO("Init FTL instance with %d channels (%ld pages)\n", conv_ftl->ssd->sp.nchs,
-		   conv_ftl->ssd->sp.tt_pgs);
+			   conv_ftl->ssd->sp.tt_pgs);
 
 	return;
 }
@@ -365,15 +447,15 @@ static void conv_remove_ftl(struct conv_ftl *conv_ftl)
 
 static void conv_init_params(struct convparams *cpp)
 {
-	cpp->op_area_pcent = OP_AREA_PERCENT;
-	cpp->gc_thres_lines = 2; /* Need only two lines.(host write, gc)*/
-	cpp->gc_thres_lines_high = 2; /* Need only two lines.(host write, gc)*/
+	cpp->op_area_pcent = OP_AREA_PERCENT; // 預留空間比例  (OOB)
+	cpp->gc_thres_lines = 2;			  /* Need only two lines.(host write, gc)*/
+	cpp->gc_thres_lines_high = 2;		  /* Need only two lines.(host write, gc)*/
 	cpp->enable_gc_delay = 1;
-	cpp->pba_pcent = (int)((1 + cpp->op_area_pcent) * 100);
+	cpp->pba_pcent = (int)((1 + cpp->op_area_pcent) * 100); // PBA 是 LBA 的 ? 倍
 }
 
 void conv_init_namespace(struct nvmev_ns *ns, uint32_t id, uint64_t size, void *mapped_addr,
-			 uint32_t cpu_nr_dispatcher)
+						 uint32_t cpu_nr_dispatcher)
 {
 	struct ssdparams spp;
 	struct convparams cpp;
@@ -387,14 +469,16 @@ void conv_init_namespace(struct nvmev_ns *ns, uint32_t id, uint64_t size, void *
 
 	conv_ftls = kmalloc(sizeof(struct conv_ftl) * nr_parts, GFP_KERNEL);
 
-	for (i = 0; i < nr_parts; i++) {
+	for (i = 0; i < nr_parts; i++)
+	{
 		ssd = kmalloc(sizeof(struct ssd), GFP_KERNEL);
 		ssd_init(ssd, &spp, cpu_nr_dispatcher);
 		conv_init_ftl(&conv_ftls[i], &cpp, ssd);
 	}
 
 	/* PCIe, Write buffer are shared by all instances*/
-	for (i = 1; i < nr_parts; i++) {
+	for (i = 1; i < nr_parts; i++)
+	{
 		kfree(conv_ftls[i].ssd->pcie->perf_model);
 		kfree(conv_ftls[i].ssd->pcie);
 		kfree(conv_ftls[i].ssd->write_buffer);
@@ -413,7 +497,7 @@ void conv_init_namespace(struct nvmev_ns *ns, uint32_t id, uint64_t size, void *
 	ns->proc_io_cmd = conv_proc_nvme_io_cmd;
 
 	NVMEV_INFO("FTL physical space: %lld, logical space: %lld (physical/logical * 100 = %d)\n",
-		   size, ns->size, cpp.pba_pcent);
+			   size, ns->size, cpp.pba_pcent);
 
 	return;
 }
@@ -425,7 +509,8 @@ void conv_remove_namespace(struct nvmev_ns *ns)
 	uint32_t i;
 
 	/* PCIe, Write buffer are shared by all instances*/
-	for (i = 1; i < nr_parts; i++) {
+	for (i = 1; i < nr_parts; i++)
+	{
 		/*
 		 * These were freed from conv_init_namespace() already.
 		 * Mark these NULL so that ssd_remove() skips it.
@@ -434,7 +519,8 @@ void conv_remove_namespace(struct nvmev_ns *ns)
 		conv_ftls[i].ssd->write_buffer = NULL;
 	}
 
-	for (i = 0; i < nr_parts; i++) {
+	for (i = 0; i < nr_parts; i++)
+	{
 		conv_remove_ftl(&conv_ftls[i]);
 		ssd_remove(conv_ftls[i].ssd);
 		kfree(conv_ftls[i].ssd);
@@ -452,7 +538,7 @@ static inline bool valid_ppa(struct conv_ftl *conv_ftl, struct ppa *ppa)
 	int pl = ppa->g.pl;
 	int blk = ppa->g.blk;
 	int pg = ppa->g.pg;
-	//int sec = ppa->g.sec;
+	// int sec = ppa->g.sec;
 
 	if (ch < 0 || ch >= spp->nchs)
 		return false;
@@ -499,6 +585,7 @@ static void mark_page_invalid(struct conv_ftl *conv_ftl, struct ppa *ppa)
 	pg->status = PG_INVALID;
 
 	/* update corresponding block status */
+	// block : 真實 block
 	blk = get_blk(conv_ftl->ssd, ppa);
 	NVMEV_ASSERT(blk->ipc >= 0 && blk->ipc < spp->pgs_per_blk);
 	blk->ipc++;
@@ -506,23 +593,31 @@ static void mark_page_invalid(struct conv_ftl *conv_ftl, struct ppa *ppa)
 	blk->vpc--;
 
 	/* update corresponding line status */
+	// line : superblock
 	line = get_line(conv_ftl, ppa);
 	NVMEV_ASSERT(line->ipc >= 0 && line->ipc < spp->pgs_per_line);
-	if (line->vpc == spp->pgs_per_line) {
+	if (line->vpc == spp->pgs_per_line)
+	{
 		NVMEV_ASSERT(line->ipc == 0);
 		was_full_line = true;
 	}
 	line->ipc++;
 	NVMEV_ASSERT(line->vpc > 0 && line->vpc <= spp->pgs_per_line);
+
 	/* Adjust the position of the victime line in the pq under over-writes */
-	if (line->pos) {
+	// 這條 line 已經在 victim PQ 裡
+	if (line->pos)
+	{
 		/* Note that line->vpc will be updated by this call */
 		pqueue_change_priority(lm->victim_line_pq, line->vpc - 1, line);
-	} else {
+	}
+	else
+	{
 		line->vpc--;
 	}
 
-	if (was_full_line) {
+	if (was_full_line)
+	{
 		/* move line: "full" -> "victim" */
 		list_del_init(&line->entry);
 		lm->full_line_cnt--;
@@ -561,7 +656,8 @@ static void mark_block_free(struct conv_ftl *conv_ftl, struct ppa *ppa)
 	struct nand_page *pg = NULL;
 	int i;
 
-	for (i = 0; i < spp->pgs_per_blk; i++) {
+	for (i = 0; i < spp->pgs_per_blk; i++)
+	{
 		/* reset page status */
 		pg = &blk->pg[i];
 		NVMEV_ASSERT(pg->nsecs == spp->secs_per_pg);
@@ -575,12 +671,14 @@ static void mark_block_free(struct conv_ftl *conv_ftl, struct ppa *ppa)
 	blk->erase_cnt++;
 }
 
+// 「表示」搬移資料前，先從原 PPA 把資料讀進 DRAM，a hook point
 static void gc_read_page(struct conv_ftl *conv_ftl, struct ppa *ppa)
 {
 	struct ssdparams *spp = &conv_ftl->ssd->sp;
 	struct convparams *cpp = &conv_ftl->cp;
 	/* advance conv_ftl status, we don't care about how long it takes */
-	if (cpp->enable_gc_delay) {
+	if (cpp->enable_gc_delay)
+	{
 		struct nand_cmd gcr = {
 			.type = GC_IO,
 			.cmd = NAND_READ,
@@ -594,6 +692,7 @@ static void gc_read_page(struct conv_ftl *conv_ftl, struct ppa *ppa)
 }
 
 /* move valid page data (already in DRAM) from victim line to a new page */
+// 將從 victim block 中讀出來的「有效 page 資料」搬到新的物理位址
 static uint64_t gc_write_page(struct conv_ftl *conv_ftl, struct ppa *old_ppa)
 {
 	struct ssdparams *spp = &conv_ftl->ssd->sp;
@@ -613,7 +712,8 @@ static uint64_t gc_write_page(struct conv_ftl *conv_ftl, struct ppa *old_ppa)
 	/* need to advance the write pointer here */
 	advance_write_pointer(conv_ftl, GC_IO);
 
-	if (cpp->enable_gc_delay) {
+	if (cpp->enable_gc_delay)
+	{
 		struct nand_cmd gcw = {
 			.type = GC_IO,
 			.cmd = NAND_NOP,
@@ -621,11 +721,13 @@ static uint64_t gc_write_page(struct conv_ftl *conv_ftl, struct ppa *old_ppa)
 			.interleave_pci_dma = false,
 			.ppa = &new_ppa,
 		};
-		if (last_pg_in_wordline(conv_ftl, &new_ppa)) {
+		// 只有寫到 wordline 最後一個 page 才真的計入一次「寫入延遲」，否則只算 metadata 操作，假裝沒有成本(NAND_NOP)
+		if (last_pg_in_wordline(conv_ftl, &new_ppa))
+		{
 			gcw.cmd = NAND_WRITE;
-			gcw.xfer_size = spp->pgsz * spp->pgs_per_oneshotpg;
+			gcw.xfer_size = spp->pgsz * spp->pgs_per_oneshotpg; // byte, NAND 操作的「模擬時間成本」的依據
 		}
-
+		//  模擬 NAND 的 I/O ： NAND 延遲、Channel 傳輸延遲、PCIe 交錯等，並更新 LUN/Channel 狀態時間
 		ssd_advance_nand(conv_ftl->ssd, &gcw);
 	}
 
@@ -648,11 +750,13 @@ static struct line *select_victim_line(struct conv_ftl *conv_ftl, bool force)
 	struct line *victim_line = NULL;
 
 	victim_line = pqueue_peek(lm->victim_line_pq);
-	if (!victim_line) {
+	if (!victim_line)
+	{
 		return NULL;
 	}
 
-	if (!force && (victim_line->vpc > (spp->pgs_per_line / 8))) {
+	if (!force && (victim_line->vpc > (spp->pgs_per_line / 8)))
+	{
 		return NULL;
 	}
 
@@ -672,12 +776,14 @@ static void clean_one_block(struct conv_ftl *conv_ftl, struct ppa *ppa)
 	int cnt = 0;
 	int pg;
 
-	for (pg = 0; pg < spp->pgs_per_blk; pg++) {
+	for (pg = 0; pg < spp->pgs_per_blk; pg++)
+	{
 		ppa->g.pg = pg;
 		pg_iter = get_pg(conv_ftl->ssd, ppa);
 		/* there shouldn't be any free page in victim blocks */
 		NVMEV_ASSERT(pg_iter->status != PG_FREE);
-		if (pg_iter->status == PG_VALID) {
+		if (pg_iter->status == PG_VALID)
+		{
 			gc_read_page(conv_ftl, ppa);
 			/* delay the maptbl update until "write" happens */
 			gc_write_page(conv_ftl, ppa);
@@ -698,7 +804,8 @@ static void clean_one_flashpg(struct conv_ftl *conv_ftl, struct ppa *ppa)
 	uint64_t completed_time = 0;
 	struct ppa ppa_copy = *ppa;
 
-	for (i = 0; i < spp->pgs_per_flashpg; i++) {
+	for (i = 0; i < spp->pgs_per_flashpg; i++)
+	{
 		pg_iter = get_pg(conv_ftl->ssd, &ppa_copy);
 		/* there shouldn't be any free page in victim blocks */
 		NVMEV_ASSERT(pg_iter->status != PG_FREE);
@@ -713,7 +820,8 @@ static void clean_one_flashpg(struct conv_ftl *conv_ftl, struct ppa *ppa)
 	if (cnt <= 0)
 		return;
 
-	if (cpp->enable_gc_delay) {
+	if (cpp->enable_gc_delay)
+	{
 		struct nand_cmd gcr = {
 			.type = GC_IO,
 			.cmd = NAND_READ,
@@ -725,11 +833,13 @@ static void clean_one_flashpg(struct conv_ftl *conv_ftl, struct ppa *ppa)
 		completed_time = ssd_advance_nand(conv_ftl->ssd, &gcr);
 	}
 
-	for (i = 0; i < spp->pgs_per_flashpg; i++) {
+	for (i = 0; i < spp->pgs_per_flashpg; i++)
+	{
 		pg_iter = get_pg(conv_ftl->ssd, &ppa_copy);
 
 		/* there shouldn't be any free page in victim blocks */
-		if (pg_iter->status == PG_VALID) {
+		if (pg_iter->status == PG_VALID)
+		{
 			/* delay the maptbl update until "write" happens */
 			gc_write_page(conv_ftl, &ppa_copy);
 		}
@@ -757,24 +867,28 @@ static int do_gc(struct conv_ftl *conv_ftl, bool force)
 	int flashpg;
 
 	victim_line = select_victim_line(conv_ftl, force);
-	if (!victim_line) {
+	if (!victim_line)
+	{
 		return -1;
 	}
 
 	ppa.g.blk = victim_line->id;
 	NVMEV_DEBUG_VERBOSE("GC-ing line:%d,ipc=%d(%d),victim=%d,full=%d,free=%d\n", ppa.g.blk,
-		    victim_line->ipc, victim_line->vpc, conv_ftl->lm.victim_line_cnt,
-		    conv_ftl->lm.full_line_cnt, conv_ftl->lm.free_line_cnt);
+						victim_line->ipc, victim_line->vpc, conv_ftl->lm.victim_line_cnt,
+						conv_ftl->lm.full_line_cnt, conv_ftl->lm.free_line_cnt);
 
 	conv_ftl->wfc.credits_to_refill = victim_line->ipc;
 
 	/* copy back valid data */
-	for (flashpg = 0; flashpg < spp->flashpgs_per_blk; flashpg++) {
+	for (flashpg = 0; flashpg < spp->flashpgs_per_blk; flashpg++)
+	{
 		int ch, lun;
 
 		ppa.g.pg = flashpg * spp->pgs_per_flashpg;
-		for (ch = 0; ch < spp->nchs; ch++) {
-			for (lun = 0; lun < spp->luns_per_ch; lun++) {
+		for (ch = 0; ch < spp->nchs; ch++)
+		{
+			for (lun = 0; lun < spp->luns_per_ch; lun++)
+			{
 				struct nand_lun *lunp;
 
 				ppa.g.ch = ch;
@@ -783,12 +897,14 @@ static int do_gc(struct conv_ftl *conv_ftl, bool force)
 				lunp = get_lun(conv_ftl->ssd, &ppa);
 				clean_one_flashpg(conv_ftl, &ppa);
 
-				if (flashpg == (spp->flashpgs_per_blk - 1)) {
+				if (flashpg == (spp->flashpgs_per_blk - 1))
+				{
 					struct convparams *cpp = &conv_ftl->cp;
 
 					mark_block_free(conv_ftl, &ppa);
 
-					if (cpp->enable_gc_delay) {
+					if (cpp->enable_gc_delay)
+					{
 						struct nand_cmd gce = {
 							.type = GC_IO,
 							.cmd = NAND_ERASE,
@@ -798,7 +914,7 @@ static int do_gc(struct conv_ftl *conv_ftl, bool force)
 						};
 						ssd_advance_nand(conv_ftl->ssd, &gce);
 					}
-
+					// 避免同時衝突/重疊操作（模擬 LUN-level busy 狀態）
 					lunp->gc_endtime = lunp->next_lun_avail_time;
 				}
 			}
@@ -813,7 +929,8 @@ static int do_gc(struct conv_ftl *conv_ftl, bool force)
 
 static void foreground_gc(struct conv_ftl *conv_ftl)
 {
-	if (should_gc_high(conv_ftl)) {
+	if (should_gc_high(conv_ftl))
+	{
 		NVMEV_DEBUG_VERBOSE("should_gc_high passed");
 		/* perform GC here until !should_gc(conv_ftl) */
 		do_gc(conv_ftl, true);
@@ -829,6 +946,7 @@ static bool is_same_flash_page(struct conv_ftl *conv_ftl, struct ppa ppa1, struc
 	return (ppa1.h.blk_in_ssd == ppa2.h.blk_in_ssd) && (ppa1_page == ppa2_page);
 }
 
+// 處理 NVMe Read
 static bool conv_read(struct nvmev_ns *ns, struct nvmev_request *req, struct nvmev_result *ret)
 {
 	struct conv_ftl *conv_ftls = (struct conv_ftl *)ns->ftls;
@@ -837,16 +955,22 @@ static bool conv_read(struct nvmev_ns *ns, struct nvmev_request *req, struct nvm
 	struct ssdparams *spp = &conv_ftl->ssd->sp;
 
 	struct nvme_command *cmd = req->cmd;
-	uint64_t lba = cmd->rw.slba;
+	uint64_t lba = cmd->rw.slba; // start lba
 	uint64_t nr_lba = (cmd->rw.length + 1);
+
+	// LBA 區間轉換成 LPN 區間（因為一個 LPN 對應一個 page）
+	// sector index mapping to page index
+	// lba 單位是 sector，一般為 512 bytes。一個 Page 裡面包含好幾個 sector
 	uint64_t start_lpn = lba / spp->secs_per_pg;
 	uint64_t end_lpn = (lba + nr_lba - 1) / spp->secs_per_pg;
+
 	uint64_t lpn;
 	uint64_t nsecs_start = req->nsecs_start;
 	uint64_t nsecs_completed, nsecs_latest = nsecs_start;
 	uint32_t xfer_size, i;
 	uint32_t nr_parts = ns->nr_parts;
 
+	// 上一次的 page 是否和這次的是同一個 flash page（if 可合併 IO ?）
 	struct ppa prev_ppa;
 	struct nand_cmd srd = {
 		.type = USER_IO,
@@ -857,46 +981,55 @@ static bool conv_read(struct nvmev_ns *ns, struct nvmev_request *req, struct nvm
 
 	NVMEV_ASSERT(conv_ftls);
 	NVMEV_DEBUG_VERBOSE("%s: start_lpn=%lld, len=%lld, end_lpn=%lld", __func__, start_lpn, nr_lba, end_lpn);
-	if ((end_lpn / nr_parts) >= spp->tt_pgs) {
+	if ((end_lpn / nr_parts) >= spp->tt_pgs)
+	{
 		NVMEV_ERROR("%s: lpn passed FTL range (start_lpn=%lld > tt_pgs=%ld)\n", __func__,
-			    start_lpn, spp->tt_pgs);
+					start_lpn, spp->tt_pgs);
 		return false;
 	}
 
-	if (LBA_TO_BYTE(nr_lba) <= (KB(4) * nr_parts)) {
+	if (LBA_TO_BYTE(nr_lba) <= (KB(4) * nr_parts))
+	{
 		srd.stime += spp->fw_4kb_rd_lat;
-	} else {
+	}
+	else
+	{
 		srd.stime += spp->fw_rd_lat;
 	}
 
-	for (i = 0; (i < nr_parts) && (start_lpn <= end_lpn); i++, start_lpn++) {
+	for (i = 0; (i < nr_parts) && (start_lpn <= end_lpn); i++, start_lpn++)
+	{
 		conv_ftl = &conv_ftls[start_lpn % nr_parts];
 		xfer_size = 0;
 		prev_ppa = get_maptbl_ent(conv_ftl, start_lpn / nr_parts);
 
 		/* normal IO read path */
-		for (lpn = start_lpn; lpn <= end_lpn; lpn += nr_parts) {
+		for (lpn = start_lpn; lpn <= end_lpn; lpn += nr_parts)
+		{
 			uint64_t local_lpn;
 			struct ppa cur_ppa;
 
 			local_lpn = lpn / nr_parts;
 			cur_ppa = get_maptbl_ent(conv_ftl, local_lpn);
-			if (!mapped_ppa(&cur_ppa) || !valid_ppa(conv_ftl, &cur_ppa)) {
+			if (!mapped_ppa(&cur_ppa) || !valid_ppa(conv_ftl, &cur_ppa))
+			{
 				NVMEV_DEBUG_VERBOSE("lpn 0x%llx not mapped to valid ppa\n", local_lpn);
 				NVMEV_DEBUG_VERBOSE("Invalid ppa,ch:%d,lun:%d,blk:%d,pl:%d,pg:%d\n",
-					    cur_ppa.g.ch, cur_ppa.g.lun, cur_ppa.g.blk,
-					    cur_ppa.g.pl, cur_ppa.g.pg);
+									cur_ppa.g.ch, cur_ppa.g.lun, cur_ppa.g.blk,
+									cur_ppa.g.pl, cur_ppa.g.pg);
 				continue;
 			}
 
-			// aggregate read io in same flash page
+			// aggregate read io in same flash page，同一 flash page 的多個 page 合併成一次 IO
 			if (mapped_ppa(&prev_ppa) &&
-			    is_same_flash_page(conv_ftl, cur_ppa, prev_ppa)) {
+				is_same_flash_page(conv_ftl, cur_ppa, prev_ppa))
+			{
 				xfer_size += spp->pgsz;
 				continue;
 			}
-
-			if (xfer_size > 0) {
+			// cur_ppa 和 prev_ppa 不是同一個 Flash Page， 聚合結束，必須發送前一段的 IO
+			if (xfer_size > 0)
+			{
 				srd.xfer_size = xfer_size;
 				srd.ppa = &prev_ppa;
 				nsecs_completed = ssd_advance_nand(conv_ftl->ssd, &srd);
@@ -908,7 +1041,8 @@ static bool conv_read(struct nvmev_ns *ns, struct nvmev_request *req, struct nvm
 		}
 
 		// issue remaining io
-		if (xfer_size > 0) {
+		if (xfer_size > 0)
+		{
 			srd.xfer_size = xfer_size;
 			srd.ppa = &prev_ppa;
 			nsecs_completed = ssd_advance_nand(conv_ftl->ssd, &srd);
@@ -951,9 +1085,10 @@ static bool conv_write(struct nvmev_ns *ns, struct nvmev_request *req, struct nv
 	};
 
 	NVMEV_DEBUG_VERBOSE("%s: start_lpn=%lld, len=%lld, end_lpn=%lld", __func__, start_lpn, nr_lba, end_lpn);
-	if ((end_lpn / nr_parts) >= spp->tt_pgs) {
+	if ((end_lpn / nr_parts) >= spp->tt_pgs)
+	{
 		NVMEV_ERROR("%s: lpn passed FTL range (start_lpn=%lld > tt_pgs=%ld)\n",
-				__func__, start_lpn, spp->tt_pgs);
+					__func__, start_lpn, spp->tt_pgs);
 		return false;
 	}
 
@@ -967,7 +1102,8 @@ static bool conv_write(struct nvmev_ns *ns, struct nvmev_request *req, struct nv
 
 	swr.stime = nsecs_latest;
 
-	for (lpn = start_lpn; lpn <= end_lpn; lpn++) {
+	for (lpn = start_lpn; lpn <= end_lpn; lpn++)
+	{
 		uint64_t local_lpn;
 		uint64_t nsecs_completed = 0;
 		struct ppa ppa;
@@ -975,8 +1111,10 @@ static bool conv_write(struct nvmev_ns *ns, struct nvmev_request *req, struct nv
 		conv_ftl = &conv_ftls[lpn % nr_parts];
 		local_lpn = lpn / nr_parts;
 		ppa = get_maptbl_ent(
-			conv_ftl, local_lpn); // Check whether the given LPN has been written before
-		if (mapped_ppa(&ppa)) {
+			conv_ftl, local_lpn);
+		// Check whether the given LPN has been written before，若該 LPN 曾被寫入，標記為「無效頁」
+		if (mapped_ppa(&ppa))
+		{
 			/* update old page information first */
 			mark_page_invalid(conv_ftl, &ppa);
 			set_rmap_ent(conv_ftl, INVALID_LPN, &ppa);
@@ -997,24 +1135,30 @@ static bool conv_write(struct nvmev_ns *ns, struct nvmev_request *req, struct nv
 		advance_write_pointer(conv_ftl, USER_IO);
 
 		/* Aggregate write io in flash page */
-		if (last_pg_in_wordline(conv_ftl, &ppa)) {
+		// 只有在整個 Flash Wordline 都寫滿時，才實際送 NAND 寫入命令
+		if (last_pg_in_wordline(conv_ftl, &ppa))
+		{
 			swr.ppa = &ppa;
 
 			nsecs_completed = ssd_advance_nand(conv_ftl->ssd, &swr);
 			nsecs_latest = max(nsecs_completed, nsecs_latest);
 
 			schedule_internal_operation(req->sq_id, nsecs_completed, wbuf,
-						    spp->pgs_per_oneshotpg * spp->pgsz);
+										spp->pgs_per_oneshotpg * spp->pgsz);
 		}
 
 		consume_write_credit(conv_ftl);
 		check_and_refill_write_credit(conv_ftl);
 	}
 
-	if ((cmd->rw.control & NVME_RW_FUA) || (spp->write_early_completion == 0)) {
+	// NVME_RW_FUA == 1 寫入資料時跳過快取，直接寫入 SSD
+	if ((cmd->rw.control & NVME_RW_FUA) || (spp->write_early_completion == 0))
+	{
 		/* Wait all flash operations */
 		ret->nsecs_target = nsecs_latest;
-	} else {
+	}
+	else
+	{
 		/* Early completion */
 		ret->nsecs_target = nsecs_xfer_completed;
 	}
@@ -1023,6 +1167,9 @@ static bool conv_write(struct nvmev_ns *ns, struct nvmev_request *req, struct nv
 	return true;
 }
 
+// 確保之前已寫入的資料已經真正寫到 NAND，而不是只在 cache 中
+// Write：可以提早完成（寫進 buffer 就好）
+// Flush：必須等所有資料都真正寫入 NAND 才算完成
 static void conv_flush(struct nvmev_ns *ns, struct nvmev_request *req, struct nvmev_result *ret)
 {
 	uint64_t start, latest;
@@ -1031,7 +1178,8 @@ static void conv_flush(struct nvmev_ns *ns, struct nvmev_request *req, struct nv
 
 	start = local_clock();
 	latest = start;
-	for (i = 0; i < ns->nr_parts; i++) {
+	for (i = 0; i < ns->nr_parts; i++)
+	{
 		latest = max(latest, ssd_next_idle_time(conv_ftls[i].ssd));
 	}
 
@@ -1048,7 +1196,8 @@ bool conv_proc_nvme_io_cmd(struct nvmev_ns *ns, struct nvmev_request *req, struc
 
 	NVMEV_ASSERT(ns->csi == NVME_CSI_NVM);
 
-	switch (cmd->common.opcode) {
+	switch (cmd->common.opcode)
+	{
 	case nvme_cmd_write:
 		if (!conv_write(ns, req, ret))
 			return false;
@@ -1062,7 +1211,7 @@ bool conv_proc_nvme_io_cmd(struct nvmev_ns *ns, struct nvmev_request *req, struc
 		break;
 	default:
 		NVMEV_ERROR("%s: command not implemented: %s (0x%x)\n", __func__,
-				nvme_opcode_string(cmd->common.opcode), cmd->common.opcode);
+					nvme_opcode_string(cmd->common.opcode), cmd->common.opcode);
 		break;
 	}
 

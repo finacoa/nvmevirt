@@ -263,6 +263,8 @@ static void __nvmev_admin_get_log_page(int eid)
 /***
  * Identify functions
  */
+
+// Namespace 的格式、大小、支援 LBA 格式等詳細設定參數
 static void __nvmev_admin_identify_namespace(int eid)
 {
 	struct nvmev_admin_queue *queue = nvmev_vdev->admin_q;
@@ -322,6 +324,7 @@ static void __nvmev_admin_identify_namespace(int eid)
 	__make_cq_entry(eid, NVME_SC_SUCCESS);
 }
 
+// 只回傳 Namespace ID 的清單
 static void __nvmev_admin_identify_namespaces(int eid)
 {
 	struct nvmev_admin_queue *queue = nvmev_vdev->admin_q;
@@ -342,6 +345,7 @@ static void __nvmev_admin_identify_namespaces(int eid)
 	__make_cq_entry(eid, NVME_SC_SUCCESS);
 }
 
+// return Identify Namespace Descriptor List
 static void __nvmev_admin_identify_namespace_desc(int eid)
 {
 	struct nvmev_admin_queue *queue = nvmev_vdev->admin_q;

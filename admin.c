@@ -270,11 +270,13 @@ static void __nvmev_admin_identify_namespace(int eid)
 	struct nvme_identify *cmd = &sq_entry(eid).identify;
 	size_t nsid = cmd->nsid - 1;
 
+	// cmd->prp1：Physical Region Page，Host 的寫回位置
 	ns = prp_address(cmd->prp1);
 	memset(ns, 0x0, PAGE_SIZE);
 
-	ns->lbaf[0].ms = 0;
-	ns->lbaf[0].ds = 9;
+	// LBA Format, 7 sets in total
+	ns->lbaf[0].ms = 0;	// metadata size = 0 byte
+	ns->lbaf[0].ds = 9;	// Data size exponent : 資料大小是 2^ds
 	ns->lbaf[0].rp = NVME_LBAF_RP_GOOD;
 
 	ns->lbaf[1].ms = 8;
@@ -309,13 +311,14 @@ static void __nvmev_admin_identify_namespace(int eid)
 		BUG();
 	}
 
-	ns->nlbaf = 6;
-	ns->dps = 0;
+	ns->nlbaf = 6;	// support 0～6 共 7 種 LBAF
+	ns->dps = 0;	// Data Protection Setting == 0
 
 	ns->nsze = (nvmev_vdev->ns[nsid].size >> ns->lbaf[ns->flbas].ds);
 	ns->ncap = ns->nsze;
 	ns->nuse = ns->nsze;
 
+	// 寫入 Completion Queue
 	__make_cq_entry(eid, NVME_SC_SUCCESS);
 }
 
@@ -613,25 +616,25 @@ static void __nvmev_proc_admin_req(int entry_id)
 	}
 }
 
-void nvmev_proc_admin_sq(int new_db, int old_db)
-{
-	struct nvmev_admin_queue *queue = nvmev_vdev->admin_q;
-	int num_proc = new_db - old_db;
-	int curr = old_db;
-	int seq;
+void nvmev_proc_admin_sq(int new_db, int old_db){
+    struct nvmev_admin_queue *queue = nvmev_vdev->admin_q;
+    int num_proc = new_db - old_db;
+    int curr = old_db;
+    int seq;
+    
+    // circular buffer !
+    if (num_proc < 0)
+        num_proc += queue->sq_depth;
+    
+    // do Polling
+    for (seq = 0; seq < num_proc; seq++) {
+        __nvmev_proc_admin_req(curr++); // 對每個命令作"翻譯"
 
-	if (num_proc < 0)
-		num_proc += queue->sq_depth;
-
-	for (seq = 0; seq < num_proc; seq++) {
-		__nvmev_proc_admin_req(curr++);
-
-		if (curr == queue->sq_depth) {
-			curr = 0;
-		}
-	}
-
-	nvmev_signal_irq(0); /* ACQ is always associated with interrupt vector 0 */
+        if (curr == queue->sq_depth) {
+            curr = 0;
+        }
+    }
+    nvmev_signal_irq(0); /* ACQ is always associated with interrupt vector 0，讓 Host 知道已處理完成，要從 CQ 取回結果*/
 }
 
 void nvmev_proc_admin_cq(int new_db, int old_db)
